@@ -6,16 +6,15 @@ from tqdm import tqdm
 import numpy as np
 
 class Index():
-    def __init__(self, docs):
-        self.docs = docs
+    def __init__(self, docs, preprocessed=False):
+        if preprocessed:
+            index, inverted = docs
+            self.index = index
+            self.inverted = inverted
+        else:
+            self.docs = docs
         self.wnl = WordNetLemmatizer()
-        self.port = PorterStemmer()
-    
-    def __init__(self, index, inverted):
-        self.wnl = WordNetLemmatizer()
-        self.port = PorterStemmer()
-        self.index = index
-        self.inverted = inverted
+        self.port = PorterStemmer()        
 
     def filter(self, token):
         t = self.port.stem(token)
@@ -95,17 +94,21 @@ class Index():
         token = self.filter(token.lower())
         return self.inverted[token]
 
-    '''def get_freq_tokens(self, query):
+    def get_docs_query(self, query):
         tokens = [token for token in query.split()]
         all = {}
         details = {}
         for token in tokens:
             docs = self.get_docs(token)
-            all.update({d[0] : for d in docs})
+            for d in docs:
+                if d[0] not in all.keys():
+                    all[d[0]] = [d[1], d[2]]
+                else:
+                    all[d[0]] = [all[d[0]][0] + d[1], all[d[0]][1] + d[2]]
             sum = {k: sum[k] + v for k, v in self.get_freq_token(token).items()}
             details[token] = {d[0]: [d[1], d[2]] for d in docs}
         sum = {k: v for k, v in sorted(sum.items(), key=lambda item: item[1])[::-1]}
-        return details, all'''
+        return details, all
         
     '''def get_freq_per_token(self, token):
         token = self.lan.stem(token.lower())
