@@ -8,9 +8,11 @@ import numpy as np
 class Index():
     def __init__(self, docs, preprocessed=False):
         if preprocessed:
-            index, inverted = docs
+            index, inverted, queries, ground_truth = docs
             self.index = index
-            self.inverted = inverted
+            self.inverted = inverted 
+            self.queries = queries
+            self.ground_truth = ground_truth
         else:
             self.docs = docs
         self.wnl = WordNetLemmatizer()
@@ -42,7 +44,7 @@ class Index():
         for i in tqdm(range(len(max))):
             d = {}
             for k, v in self.frequencies[i].items():
-                d[k] = round((v/max[i]) * np.log10(len(max)/len(self.get_docs_per_token(k))+1), 2)
+                d[k] = round((v/max[i]) * np.log10(len(max)/len(self.get_docs(k, preprocessed=True))+1), 2)
             self.weights.append(d)
         
     def combine(self, origin):
@@ -51,7 +53,7 @@ class Index():
         for o in origin:
             sets = sets | set(o)
         frequencies = [{k: origin[i].get(k) if origin[i].get(k) else  0 for k in sets} for i in range(len(origin))]
-        for freq, d in zip(frequencies, range(len(frequencies))):
+        for freq, d in tqdm(zip(frequencies, range(len(frequencies)))):
             for k, v in freq.items():
                 out[(k, d)] = v
         return out
@@ -61,10 +63,15 @@ class Index():
         self.tokenize()
         print('Getting frequencies...')
         self.get_freq()
+        print('Combining...')
         self.all_frequencies = self.combine(self.frequencies) 
+        self.get_inverted_f()
         print('Getting weights...')
         self.get_weights()
+        print('Combining...')
         self.all_weights = self.combine(self.weights) 
+        self.get_index()
+        self.get_inverted()
         
     def get_index(self):
         index = {}
@@ -74,6 +81,16 @@ class Index():
                 d.append([token, f[token], w[token]])
             index[doc] = d
         self.index = index
+
+    def get_inverted_f(self):
+        inverted = {}
+        for doc, f in enumerate(self.frequencies):
+            for token in list(f.keys()):
+                if token in inverted.keys():
+                    inverted[token].append([doc, f[token]]) 
+                else:
+                    inverted[token] = [[doc, f[token]]]
+        self.inverted = inverted
 
     def get_inverted(self):
         inverted = {}
@@ -88,10 +105,11 @@ class Index():
     def get_docs_per_token(self, token):
         f = {d: v for (t, d), v in self.all_frequencies.items() if token == t} 
         f = [i for i in list(f.values()) if i != 0]
-        return f
+        return f 
     
-    def get_docs(self, token):
-        token = self.filter(token.lower())
+    def get_docs(self, token, preprocessed=False):
+        if not preprocessed:
+            token = self.filter(token.lower())
         return self.inverted[token]
 
     def get_docs_query(self, query):
@@ -102,26 +120,54 @@ class Index():
             docs = self.get_docs(token)
             for d in docs:
                 if d[0] not in all.keys():
-                    all[d[0]] = [d[1], d[2]]
+                    all[d[0]] = [[d[1]], [d[2]]]
                 else:
-                    all[d[0]] = [all[d[0]][0] + d[1], all[d[0]][1] + d[2]]
-            sum = {k: sum[k] + v for k, v in self.get_freq_token(token).items()}
+                    all[d[0]] = [[all[d[0]][0][0] + d[1]], [round(all[d[0]][1][0] + d[2], 2)]]
             details[token] = {d[0]: [d[1], d[2]] for d in docs}
-        sum = {k: v for k, v in sorted(sum.items(), key=lambda item: item[1])[::-1]}
         return details, all
-        
-    '''def get_freq_per_token(self, token):
-        token = self.lan.stem(token.lower())
-        return [l[0] for l in self.inverted[token]]
-        #return {d: v for (t, d), v in self.all_frequencies.items() if token == t}
 
-    def get_weight_per_token(self, token):
-        token = self.lan.stem(token.lower())
-        return {d: v for (t, d), v in self.all_weights.items() if token == t}
+    def scalar_prod(self, doc, query):
+        result = 0
+        for token in doc:
+            if token in query:
+                result += np.sum([l[2] for l in self.get_docs(token, preprocessed=True)])
+        return result
 
-    def get_docs(self, token):
-        token = self.lan.stem(token.lower())
-        return 
+    def cosine_measure(self, doc, query):
+        w = [self.get_docs(token, preprocessed=True)[0][2] for token in doc]
+        result = np.sqrt(len(query)) * np.sqrt(np.dot(w, w))
+        return self.scalar_prod(doc, query) / result
 
-    def get_tokens(self, doc):
-        return {t: v for (t, d), v in self.all_frequencies.items() if doc == d}'''
+    def jaccard_measure(self, doc, query):
+        w = [self.get_docs(token, preprocessed=True)[0][2] for token in doc]
+        result = len(query) + np.dot(w, w) - self.scalar_prod(doc, query)
+        return self.scalar_prod(doc, query) / result
+
+    def vector_search(self, max_docs=50, metric='scalar'):
+        queries = np.unique(self.ground_truth['Query'])
+        relevent_docs = [list(self.ground_truth[self.ground_truth['Query'] == q]['Relevent document']) for q in queries]
+        predicted = {}
+        if metric == 'scalar':
+            metric = self.scalar_prod
+        elif metric == 'cosine':
+            metric = self.cosine_measure
+        elif metric == 'jaccard':
+            metric = self.jaccard_measure
+        #max_docs = max([len(l) for l in relevent_docs])
+        for q in tqdm(queries):
+            pred = []
+            query = self.queries[str(q)]
+            for doc, tokens in self.index.items():
+                pred.append([q, doc, metric([t[0] for t in tokens], query)])
+            pred = sorted(pred, key=lambda x: x[2], reverse=True)
+            predicted[q] = [p[1] for p in pred[:max_docs]]
+        return predicted.values(), relevent_docs
+
+    def PR(self, pred, relevent):
+        precisions = []
+        recalls = []
+        for p, r in zip(pred, relevent):
+            TP = len(set(p) & set(r))
+            precisions.append(TP/len(p))
+            recalls.append(TP/len(r))
+        return np.mean(precisions), np.mean(recalls)
