@@ -1,6 +1,8 @@
 import math
+
 import numpy as np
 from tqdm import tqdm
+
 
 class DBSCAN():
     def __init__(self, eps=1, min_samples=5):

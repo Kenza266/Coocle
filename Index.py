@@ -1,18 +1,38 @@
+import json
+import math
+import re
+
 import nltk
-from nltk.stem import WordNetLemmatizer
-from nltk.stem import PorterStemmer
+import numpy as np
+import pandas as pd
+from nltk.stem import PorterStemmer, WordNetLemmatizer
+from rank_bm25 import BM25Okapi
 from tqdm import tqdm
 
-import numpy as np
 
 class Index():
     def __init__(self, docs, preprocessed=False):
         if preprocessed:
-            index, inverted, queries, ground_truth = docs
+            index, inverted, queries, ground_truth, raw_queries, raw_docs = docs
+            with open(queries) as f:
+                queries = json.load(f) 
+            ground_truth = pd.read_csv(ground_truth, sep=',')
+            with open(index) as f:
+                index = json.load(f)
+            with open(inverted) as f:
+                inverted = json.load(f)
+            with open(raw_queries) as f:
+                raw_queries = json.load(f)
+            with open(raw_docs) as f:
+                raw_docs = json.load(f)
             self.index = index
             self.inverted = inverted 
             self.queries = queries
             self.ground_truth = ground_truth
+            self.raw_queries = raw_queries
+            self.raw_docs = raw_docs
+            queries = np.unique(self.ground_truth['Query'])
+            self.relevent_docs = [list(self.ground_truth[self.ground_truth['Query'] == q]['Relevent document']) for q in queries]
         else:
             self.docs = docs
         self.wnl = WordNetLemmatizer()
@@ -76,9 +96,9 @@ class Index():
     def get_index(self):
         index = {}
         for doc, (w, f) in enumerate(zip(self.weights, self.frequencies)):
-            d = []
+            d = {}
             for token in list(w.keys()):
-                d.append([token, f[token], w[token]])
+                d[token] = (f[token], w[token])
             index[doc] = d
         self.index = index
 
@@ -86,31 +106,42 @@ class Index():
         inverted = {}
         for doc, f in enumerate(self.frequencies):
             for token in list(f.keys()):
-                if token in inverted.keys():
-                    inverted[token].append([doc, f[token]]) 
-                else:
-                    inverted[token] = [[doc, f[token]]]
-        self.inverted = inverted
+                if token not in inverted.keys():
+                    inverted[token] = {}
+                inverted[token][doc] = f[token] 
+        self.inverted = inverted 
 
     def get_inverted(self):
         inverted = {}
         for doc, (w, f) in enumerate(zip(self.weights, self.frequencies)):
             for token in list(w.keys()):
-                if token in inverted.keys():
-                    inverted[token].append([doc, f[token], w[token]]) 
-                else:
-                    inverted[token] = [[doc, f[token], w[token]]]
+                if token not in inverted.keys():
+                    inverted[token] = {}
+                inverted[token][doc] = (f[token], w[token])
         self.inverted = inverted
         
-    def get_docs_per_token(self, token):
-        f = {d: v for (t, d), v in self.all_frequencies.items() if token == t} 
-        f = [i for i in list(f.values()) if i != 0]
-        return f 
-    
-    def get_docs(self, token, preprocessed=False):
+    def get_docs(self, token, details=False, preprocessed=False):
         if not preprocessed:
             token = self.filter(token.lower())
-        return self.inverted[token]
+        if details:
+            return self.inverted[token]
+        return list(self.inverted[token].keys())
+
+    def get_weight(self, doc, token, preprocessed=False):
+        if not preprocessed:
+            token = self.filter(token.lower())
+        try:
+            return self.index[doc][token][1]
+        except:
+            return 0
+
+    def get_frequency(self, doc, token, preprocessed=False):
+        if not preprocessed:
+            token = self.filter(token.lower())
+        try:
+            return self.index[doc][token][0]
+        except:
+            return 0
 
     def get_docs_query(self, query):
         tokens = [token for token in query.split()]
@@ -119,55 +150,163 @@ class Index():
         for token in tokens:
             docs = self.get_docs(token)
             for d in docs:
-                if d[0] not in all.keys():
-                    all[d[0]] = [[d[1]], [d[2]]]
+                f, w = self.get_frequency(d, token), self.get_weight(d, token)
+                if d not in all.keys():
+                    all[d] = [f, w] 
                 else:
-                    all[d[0]] = [[all[d[0]][0][0] + d[1]], [round(all[d[0]][1][0] + d[2], 2)]]
-            details[token] = {d[0]: [d[1], d[2]] for d in docs}
+                    all[d] = [all[d][0] + f, round(all[d][1] + w, 2)]
+            details[token] = {d: [f, w] for d in docs}
         return details, all
 
-    def scalar_prod(self, doc, query):
+    def scalar_prod(self, n_doc, query):
         result = 0
-        for token in doc:
-            if token in query:
-                result += np.sum([l[2] for l in self.get_docs(token, preprocessed=True)])
+        for token in query:
+            result += self.get_weight(n_doc, token)
         return result
-
-    def cosine_measure(self, doc, query):
-        w = [self.get_docs(token, preprocessed=True)[0][2] for token in doc]
+    
+    def cosine_measure(self, n_doc, query):
+        w = [self.get_weight(n_doc, token, preprocessed=True) for token in list(self.index[n_doc].keys())]
         result = np.sqrt(len(query)) * np.sqrt(np.dot(w, w))
-        return self.scalar_prod(doc, query) / result
+        return self.scalar_prod(n_doc, query) / result 
 
-    def jaccard_measure(self, doc, query):
-        w = [self.get_docs(token, preprocessed=True)[0][2] for token in doc]
-        result = len(query) + np.dot(w, w) - self.scalar_prod(doc, query)
-        return self.scalar_prod(doc, query) / result
+    def jaccard_measure(self, n_doc, query):
+        w = [self.get_weight(n_doc, token, preprocessed=True) for token in query]
+        result = len(query) + np.dot(w, w) - self.scalar_prod(n_doc, query)
+        return self.scalar_prod(n_doc, query) / result
 
     def vector_search(self, max_docs=50, metric='scalar'):
         queries = np.unique(self.ground_truth['Query'])
-        relevent_docs = [list(self.ground_truth[self.ground_truth['Query'] == q]['Relevent document']) for q in queries]
-        predicted = {}
+        predicted = {} 
         if metric == 'scalar':
             metric = self.scalar_prod
         elif metric == 'cosine':
             metric = self.cosine_measure
         elif metric == 'jaccard':
             metric = self.jaccard_measure
-        #max_docs = max([len(l) for l in relevent_docs])
         for q in tqdm(queries):
-            pred = []
-            query = self.queries[str(q)]
-            for doc, tokens in self.index.items():
-                pred.append([q, doc, metric([t[0] for t in tokens], query)])
-            pred = sorted(pred, key=lambda x: x[2], reverse=True)
-            predicted[q] = [p[1] for p in pred[:max_docs]]
-        return predicted.values(), relevent_docs
+            pred = {} 
+            query = self.queries[str(q-1)] 
+            for doc, _ in self.index.items():
+                pred[doc] = metric(doc, query)
+            pred = dict(sorted(pred.items(), key=lambda x: x[1], reverse=True))
+            predicted[q] = [p for p in list(pred.items())[:max_docs]] 
+        return predicted
 
     def PR(self, pred, relevent):
         precisions = []
         recalls = []
+        #len_TP = []
+        #len_pred = []
         for p, r in zip(pred, relevent):
+            if type(p[0]) == str:
+                r = [str(i) for i in r]
             TP = len(set(p) & set(r))
             precisions.append(TP/len(p))
-            recalls.append(TP/len(r))
-        return np.mean(precisions), np.mean(recalls)
+            recalls.append(TP/len(r)) 
+            #len_TP.append(TP)
+            #len_pred.append(len(p))
+        return precisions, recalls, np.mean(precisions), np.mean(recalls) # np.mean(len_TP), np.mean(len_pred)
+
+    def accuracy(self, pred, relevent):
+        acc = []
+        for p, r in zip(pred, relevent):
+            if type(p[0]) == str:
+                r = [str(i) for i in r]
+            TP = len(set(p) & set((r)))
+            acc.append(TP/len(r))
+        return acc, np.mean(acc)
+
+    def BM25_per_doc(self, n_doc, doc, query, avgdl, N, b=0.75, k1=1.2):
+        score = 0
+        for token in query:
+            try:
+                temp = self.get_docs(token, preprocessed=True)
+            except:
+                temp = []
+            tf = self.get_weight(n_doc, token, preprocessed=True)
+            dl = len(doc)
+            n = len(temp)
+            idf = math.log((N - n + 0.5) / (n + 0.5))
+            w = idf * (tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl)))
+            score += w
+        return score
+
+    def BM25(self):
+        pred = []
+        queries = np.unique(self.ground_truth['Query'])
+        N = len(self.index)
+        avgdl = sum([len(t) for _, t in self.index.items()]) / N
+        for q in tqdm(queries):
+            query = self.queries[str(q-1)] 
+            scores = []
+            for doc, tokens in self.index.items():
+                scores.append(self.BM25_per_doc(doc, tokens, query, avgdl, N))
+            pred.append(sorted(zip(range(N), scores), key=lambda x: x[1], reverse=True))
+        return pred
+
+    def BM25_kapi(self):
+        bm25 = BM25Okapi([[i[0] for i in j] for j in list(self.index.values())])
+        queries = np.unique(self.ground_truth['Query'])
+        pred = []
+        for q in tqdm(queries):
+            query = self.queries[str(q-1)] 
+            pred.append(sorted(enumerate(bm25.get_scores(query)), key=lambda x: x[1], reverse=True)) 
+        return pred
+
+    def evaluate(self, stack):
+        # print(stack)
+        if len(stack) == 1:
+            return stack[0]
+
+        if '(' in stack:
+            start = stack.index('(')
+            jump = 0
+            for i in range(start+1, len(stack)):
+                if stack[i] == '(':
+                    jump += 1
+                elif stack[i] == ')':
+                    if jump == 0:
+                        end = i+1
+                        break
+                    else:
+                        jump -= 1
+            res = self.evaluate(stack[start+1: end-1])
+            stack[start] = res
+            for i in range(start, end-1):
+                stack.pop(start+1)
+            return self.evaluate(stack)
+            
+        if 'not' in stack:
+            op = stack.index('not')
+            right = stack.pop(op + 1) 
+            stack[op] = [i for i in list(range(len(self.index))) if str(i) not in right] 
+            return self.evaluate(stack)
+
+        if 'and' in stack:
+            op = stack.index('and')
+            left = stack.pop(op - 1)
+            right = stack.pop(op)
+            stack[op-1] = list(set(left).intersection(right))
+            return self.evaluate(stack)
+
+        if 'or' in stack:
+            op = stack.index('or')
+            left = stack.pop(op - 1)
+            right = stack.pop(op)
+            stack[op-1] = list(set(left).union(right))
+            return self.evaluate(stack)
+
+    def parse_boolean_query(self, query='structures and structural or formulas or (drawing and compounds or chemical)'):
+        query = query.lower()
+        pattern = re.compile(r'(\(|\)|\w+|and|or|not)')
+        stack = []
+        parsed = pattern.findall(query)
+        
+        for token in parsed:
+            if token in ['(', ')', 'or', 'and', 'not']:
+                stack.append(token)
+            else:
+                stack.append(self.get_docs(token))
+
+        result = self.evaluate(stack)
+        return result
